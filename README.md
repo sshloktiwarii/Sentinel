@@ -1,4 +1,4 @@
-# Sentinel-AI 🛡️
+# Sentinel-AI
 
 **Zero-overhead unified memory telemetry and runaway agent loop tripwire for Apple Silicon.**
 
@@ -112,8 +112,8 @@ Sentinel-AI features a zero-dependency configuration engine storing user prefere
 | :--- | :--- | :--- | :--- |
 | `proxy_url` | `str` | `"http://localhost:20128"` | Base URL of local proxy router (OmniRoute / LiteLLM). |
 | `poll_interval_seconds` | `float` | `1.0` | Telemetry probe sampling interval in seconds. |
-| `tdi_warning_threshold` | `float` | `0.75` | TDI threshold for warning indicator (🟡). |
-| `tdi_critical_threshold`| `float` | `0.90` | TDI threshold for critical notification tripwire (🔴). |
+| `tdi_warning_threshold` | `float` | `0.75` | TDI threshold for warning indicator (warning state). |
+| `tdi_critical_threshold`| `float` | `0.90` | TDI threshold for critical notification tripwire (critical state). |
 | `velocity_alert_tps` | `float` | `150.0` | Token velocity threshold triggering runaway agent alerts. |
 | `velocity_alert_rpm` | `float` | `45.0` | Request rate threshold triggering runaway loop warnings. |
 | `notification_debounce_seconds` | `float` | `60.0` | Cooldown window between repeated velocity banner alerts. |
