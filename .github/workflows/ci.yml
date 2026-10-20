@@ -1,0 +1,47 @@
+name: Sentinel CI (Apple Silicon & Linux)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test-macos:
+    name: Native Darwin Mach Telemetry (macOS Apple Silicon)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pytest-asyncio psutil httpx uvicorn fastapi websockets
+
+      - name: Run Test Suite
+        run: |
+          pytest tests/ -v
+
+  lint:
+    name: Code Hygiene & Secrets Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Scan for Unredacted Secrets
+        run: |
+          if git grep -E "\bsk-[a-zA-Z0-9_-]{20,}" | grep -v -E "sk-(test|mock|tenant|alice|bob|sample|soak|sentinel|shared)"; then
+            echo "ERROR: Potential unredacted production secret detected in working tree!"
+            exit 1
+          fi
+          echo "✓ Secrets scan clean."

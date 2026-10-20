@@ -1,0 +1,46 @@
+name: Sentinel-AI Release & Homebrew Formula Synchronizer
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: GitHub Release & Formula Checksum
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create Release Tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          git archive --format=tar.gz --prefix="sentinel-ai-${GITHUB_REF_NAME}/" -o "sentinel-ai-${GITHUB_REF_NAME}.tar.gz" "${GITHUB_REF_NAME}"
+          SHA256=$(shasum -a 256 "sentinel-ai-${GITHUB_REF_NAME}.tar.gz" | cut -d ' ' -f 1)
+          echo "TARBALL_SHA256=${SHA256}" >> $GITHUB_ENV
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sentinel-ai-${{ github.ref_name }}.tar.gz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Formula/sentinel.rb
+        run: |
+          ARCHIVE_URL="https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz"
+          sed -i '' "s|url \".*\"|url \"$ARCHIVE_URL\"|" Formula/sentinel.rb
+          sed -i '' "s|sha256 \".*\"|sha256 \"$TARBALL_SHA256\"|" Formula/sentinel.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(homebrew): bump Formula/sentinel.rb to ${{ github.ref_name }}" || true
+          git push origin main || true
