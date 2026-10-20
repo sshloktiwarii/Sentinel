@@ -49,6 +49,78 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+import logging
+import signal
+import subprocess
+
+logger = logging.getLogger("sentinel.server")
+
+# Track paused process PIDs for SIGSTOP/SIGCONT recovery
+_THROTTLED_PIDS: set[int] = set()
+
+
+def _get_target_llm_pids() -> list[int]:
+    """Find running local LLM engine processes (ollama, llama-server, vllm)."""
+    pids = []
+    try:
+        output = subprocess.check_output(
+            ["pgrep", "-f", "ollama|llama-server|vllm|text-generation"],
+            text=True,
+        )
+        for line in output.strip().splitlines():
+            pid = int(line.strip())
+            if pid != os.getpid():
+                pids.append(pid)
+    except Exception:
+        pass
+    return pids
+
+
+def apply_active_process_throttling(thrash_index: float) -> list[int]:
+    """
+    Active Process Throttling: If memory pressure reaches critical levels (TDI >= 0.90),
+    actively pause runaway LLM inference processes via SIGSTOP to prevent macOS kernel swap freeze.
+    When thrash drops back into safety (TDI < 0.75), resumes them with SIGCONT.
+    """
+    cfg = get_config()
+    auto_throttle_enabled = cfg.get("auto_throttle", True)
+    if not auto_throttle_enabled:
+        return []
+
+    crit_th = float(cfg.get("tdi_critical_threshold", 0.90))
+    warn_th = float(cfg.get("tdi_warning_threshold", 0.75))
+
+    actioned = []
+    if thrash_index >= crit_th:
+        target_pids = _get_target_llm_pids()
+        for pid in target_pids:
+            if pid not in _THROTTLED_PIDS:
+                try:
+                    os.kill(pid, signal.SIGSTOP)
+                    _THROTTLED_PIDS.add(pid)
+                    actioned.append(pid)
+                    logger.warning(
+                        "🛑 ACTIVE THROTTLE: Paused runaway LLM process PID %d via SIGSTOP (TDI: %.2f)",
+                        pid,
+                        thrash_index,
+                    )
+                except Exception as e:
+                    logger.error("Failed to SIGSTOP PID %d: %s", pid, e)
+    elif thrash_index < warn_th and _THROTTLED_PIDS:
+        # Memory pressure normalized: resume paused processes
+        for pid in list(_THROTTLED_PIDS):
+            try:
+                os.kill(pid, signal.SIGCONT)
+                actioned.append(pid)
+                logger.info("▶ ACTIVE THROTTLE RESUME: Resumed LLM process PID %d via SIGCONT", pid)
+            except Exception as e:
+                logger.error("Failed to SIGCONT PID %d: %s", pid, e)
+            finally:
+                _THROTTLED_PIDS.discard(pid)
+
+    return actioned
+
+
 def get_alert_pill(tdi: float) -> str:
     """Map Thrash Danger Index to alert pill color indicator based on config thresholds."""
     cfg = get_config()
@@ -70,6 +142,7 @@ def _collect_reading() -> dict:
     thrash_index = compute_thrash_danger_index(wired_mb, limit_mb, used_swap)
     engine_info  = get_engine_pressure_snapshot(wired_mb)
     velocity     = get_velocity_metrics()
+    throttled    = apply_active_process_throttling(thrash_index)
     ts           = time.time()
     return {
         "timestamp":        ts,
@@ -84,6 +157,7 @@ def _collect_reading() -> dict:
         "kv_cache_mb":      engine_info.get("kv_cache_mb", 0.0),
         "kv_pressure_pct":  engine_info.get("kv_pressure_pct", 0.0),
         "velocity":         velocity,
+        "throttled_pids":   list(_THROTTLED_PIDS),
         "is_apple_silicon": is_apple_silicon(),
     }
 

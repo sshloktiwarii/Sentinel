@@ -42,17 +42,20 @@ __all__ = [
 
 _non_arm64_notice_logged: bool = False
 
+import sys
+
 # ── Darwin C-Library & Struct Definitions ─────────────────────────────────────
 
 _libc: ctypes.CDLL | None = None
 
-try:
-    _libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-except Exception:
+if sys.platform == "darwin":
     try:
-        _libc = ctypes.CDLL(None)
+        _libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
     except Exception:
-        _libc = None
+        try:
+            _libc = ctypes.CDLL(None)
+        except Exception:
+            _libc = None
 
 
 class XswUsage(ctypes.Structure):
@@ -251,6 +254,10 @@ def get_dynamic_wired_limit_mb() -> int:
 # ── Subprocess Fallbacks (for test harness compatibility) ─────────────────────
 
 def _fallback_get_gpu_wired_limit_subprocess() -> float:
+    if sys.platform != "darwin":
+        # On Linux/CI, simulate 75% of total RAM or /proc/meminfo
+        return round(get_total_physical_memory_mb() * 0.75, 2)
+
     try:
         output = subprocess.check_output(
             ["sysctl", "-n", "iogpu.wired_limit_mb"],
@@ -278,6 +285,22 @@ def _fallback_get_gpu_wired_limit_subprocess() -> float:
 
 
 def _fallback_get_swap_usage_subprocess() -> tuple[float, float]:
+    if sys.platform != "darwin":
+        # On Linux/CI, query /proc/meminfo for SwapTotal and SwapFree
+        try:
+            total_mb = 0.0
+            free_mb = 0.0
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("SwapTotal:"):
+                        total_mb = float(line.split()[1]) / 1024.0
+                    elif line.startswith("SwapFree:"):
+                        free_mb = float(line.split()[1]) / 1024.0
+            used_mb = max(0.0, total_mb - free_mb)
+            return round(total_mb, 2), round(used_mb, 2)
+        except Exception:
+            return 0.0, 0.0
+
     try:
         try:
             output = subprocess.check_output(
@@ -298,6 +321,17 @@ def _fallback_get_swap_usage_subprocess() -> tuple[float, float]:
 
 
 def _fallback_get_pageout_count_subprocess() -> int:
+    if sys.platform != "darwin":
+        # On Linux/CI, query /proc/vmstat for pgpgout or pswpout
+        try:
+            with open("/proc/vmstat", "r") as f:
+                for line in f:
+                    if line.startswith("pswpout") or line.startswith("pgpgout"):
+                        return int(line.split()[1])
+        except Exception:
+            pass
+        return 0
+
     try:
         result = subprocess.run(
             ["vm_stat"],
@@ -315,6 +349,17 @@ def _fallback_get_pageout_count_subprocess() -> int:
 
 
 def _fallback_get_wired_memory_mb_subprocess() -> float:
+    if sys.platform != "darwin":
+        # On Linux/CI, estimate wired memory from /proc/meminfo Active(anon) or Mlocked
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("Active(anon):") or line.startswith("Mlocked:"):
+                        return round(float(line.split()[1]) / 1024.0, 2)
+        except Exception:
+            pass
+        return 0.0
+
     default_page_size = 16384
     try:
         result = subprocess.run(
