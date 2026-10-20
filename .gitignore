@@ -27,3 +27,10 @@ brag-output*/
 brag-clean/
 captured-dashboard/
 scratch/
+
+# System & temporary files
+*.tmp
+*.swp
+*.pyc
+.env
+.env.local
