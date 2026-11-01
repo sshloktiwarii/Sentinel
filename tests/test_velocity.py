@@ -253,27 +253,42 @@ class TestHardenedNotificationDispatch:
 
     def test_notification_sanitization_and_subprocess_args(self):
         tracker = TokenVelocityTracker()
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value.returncode = 0
+        with patch("subprocess.Popen") as mock_popen:
             tracker.dispatch_notification(
                 message='Malicious "string" with \\ backslash',
                 title='Alert "Title" \\',
-                subtitle='Sub "Title" \\',
             )
-            mock_run.assert_called_once()
-            args, kwargs = mock_run.call_args
+            mock_popen.assert_called_once()
+            args, kwargs = mock_popen.call_args
             cmd = args[0]
             assert cmd[0] == "osascript"
             assert cmd[1] == "-e"
-            script = cmd[2]
-            assert kwargs.get("shell") is False
-            assert kwargs.get("timeout") == 5
-            assert r'\"string\"' in script
-            assert r'\\ backslash' in script
-            assert r'\"Title\"' in script
+            assert "on run {msg, title}" in cmd[2]
+            assert "display notification msg with title title" in cmd[2]
+            # Verify payload is passed safely via argv rather than interpolated into the script
+            assert cmd[3] == 'Malicious "string" with \\ backslash'
+            assert cmd[4] == 'Alert "Title" \\'
+
+    def test_notification_with_subtitle_args(self):
+        tracker = TokenVelocityTracker()
+        with patch("subprocess.Popen") as mock_popen:
+            tracker.dispatch_notification(
+                message='Msg',
+                title='Title',
+                subtitle='Sub',
+            )
+            mock_popen.assert_called_once()
+            args, kwargs = mock_popen.call_args
+            cmd = args[0]
+            assert cmd[0] == "osascript"
+            assert cmd[1] == "-e"
+            assert "on run {msg, title, sub}" in cmd[2]
+            assert cmd[3] == 'Msg'
+            assert cmd[4] == 'Title'
+            assert cmd[5] == 'Sub'
 
     def test_notification_exception_handling_never_crashes(self):
         tracker = TokenVelocityTracker()
-        with patch("subprocess.run", side_effect=RuntimeError("Subprocess execution failed")):
+        with patch("subprocess.Popen", side_effect=RuntimeError("Subprocess execution failed")):
             # Should catch silently without raising
             tracker.dispatch_notification("Test message", "Test title")

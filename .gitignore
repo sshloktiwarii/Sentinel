@@ -34,3 +34,7 @@ scratch/
 *.pyc
 .env
 .env.local
+
+graphify-out/
+brag-output/
+

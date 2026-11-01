@@ -12,6 +12,8 @@ Exposes:
 """
 
 import asyncio
+import atexit
+import json
 import os
 from pathlib import Path
 import time
@@ -56,19 +58,91 @@ import subprocess
 logger = logging.getLogger("sentinel.server")
 
 # Track paused process PIDs for SIGSTOP/SIGCONT recovery
-_THROTTLED_PIDS: set[int] = set()
+DEFAULT_SENTINEL_DIR = Path.home() / ".sentinel"
+
+
+def _get_throttled_pids_path() -> Path:
+    """Return path to persistent state file for throttled PIDs."""
+    return Path(
+        os.environ.get(
+            "SENTINEL_THROTTLED_PIDS_PATH",
+            str(DEFAULT_SENTINEL_DIR / "throttled_pids.json"),
+        )
+    )
+
+
+def _load_throttled_pids() -> set[int]:
+    """Load persisted throttled PIDs from disk."""
+    path = _get_throttled_pids_path()
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return {int(p) for p in data if isinstance(p, (int, str)) and str(p).isdigit()}
+    except Exception as exc:
+        logger.warning("Failed to load throttled PIDs from %s: %s", path, exc)
+    return set()
+
+
+def _save_throttled_pids(pids: set[int]) -> None:
+    """Persist throttled PIDs atomically to disk."""
+    path = _get_throttled_pids_path()
+    try:
+        if not pids:
+            if path.exists():
+                path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(sorted(list(pids))), encoding="utf-8")
+        tmp_path.replace(path)
+    except Exception as exc:
+        logger.warning("Failed to persist throttled PIDs to %s: %s", path, exc)
+
+
+_THROTTLED_PIDS: set[int] = _load_throttled_pids()
+
+
+def resume_all_throttled_processes() -> list[int]:
+    """
+    Iterate over all tracked and persisted throttled PIDs and send SIGCONT,
+    ensuring no LLM processes remain frozen.
+    Clears in-memory set and state file.
+    """
+    global _THROTTLED_PIDS
+    pids_to_resume = set(_THROTTLED_PIDS) | _load_throttled_pids()
+    resumed = []
+    for pid in sorted(pids_to_resume):
+        try:
+            os.kill(pid, signal.SIGCONT)
+            resumed.append(pid)
+            logger.info("▶ RESUMED FROZEN PROCESS: Sent SIGCONT to PID %d", pid)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            logger.error("Failed to send SIGCONT to PID %d: %s", pid, e)
+
+    _THROTTLED_PIDS.clear()
+    _save_throttled_pids(set())
+    return resumed
+
+
+atexit.register(resume_all_throttled_processes)
 
 
 def _get_target_llm_pids() -> list[int]:
-    """Find running local LLM engine processes (ollama, llama-server, vllm)."""
+    """Find running local LLM engine processes (ollama, llama-server, vllm) using exact matching."""
     pids = []
     try:
         output = subprocess.check_output(
-            ["pgrep", "-f", "ollama|llama-server|vllm|text-generation"],
+            ["pgrep", "-x", "ollama|llama-server|vllm|text-generation"],
             text=True,
         )
         for line in output.strip().splitlines():
-            pid = int(line.strip())
+            line_str = line.strip()
+            if not line_str:
+                continue
+            pid = int(line_str)
             if pid != os.getpid():
                 pids.append(pid)
     except Exception:
@@ -81,6 +155,7 @@ def apply_active_process_throttling(thrash_index: float) -> list[int]:
     Active Process Throttling: If memory pressure reaches critical levels (TDI >= 0.90),
     actively pause runaway LLM inference processes via SIGSTOP to prevent macOS kernel swap freeze.
     When thrash drops back into safety (TDI < 0.75), resumes them with SIGCONT.
+    Persists throttled PIDs to state set/file so no processes remain frozen across daemon restarts.
     """
     cfg = get_config()
     auto_throttle_enabled = cfg.get("auto_throttle", True)
@@ -93,11 +168,13 @@ def apply_active_process_throttling(thrash_index: float) -> list[int]:
     actioned = []
     if thrash_index >= crit_th:
         target_pids = _get_target_llm_pids()
+        newly_throttled = False
         for pid in target_pids:
             if pid not in _THROTTLED_PIDS:
                 try:
                     os.kill(pid, signal.SIGSTOP)
                     _THROTTLED_PIDS.add(pid)
+                    newly_throttled = True
                     actioned.append(pid)
                     logger.warning(
                         "🛑 ACTIVE THROTTLE: Paused runaway LLM process PID %d via SIGSTOP (TDI: %.2f)",
@@ -106,6 +183,8 @@ def apply_active_process_throttling(thrash_index: float) -> list[int]:
                     )
                 except Exception as e:
                     logger.error("Failed to SIGSTOP PID %d: %s", pid, e)
+        if newly_throttled:
+            _save_throttled_pids(_THROTTLED_PIDS)
     elif thrash_index < warn_th and _THROTTLED_PIDS:
         # Memory pressure normalized: resume paused processes
         for pid in list(_THROTTLED_PIDS):
@@ -113,10 +192,13 @@ def apply_active_process_throttling(thrash_index: float) -> list[int]:
                 os.kill(pid, signal.SIGCONT)
                 actioned.append(pid)
                 logger.info("▶ ACTIVE THROTTLE RESUME: Resumed LLM process PID %d via SIGCONT", pid)
+            except ProcessLookupError:
+                pass
             except Exception as e:
                 logger.error("Failed to SIGCONT PID %d: %s", pid, e)
             finally:
                 _THROTTLED_PIDS.discard(pid)
+        _save_throttled_pids(_THROTTLED_PIDS)
 
     return actioned
 
@@ -208,9 +290,19 @@ async def _telemetry_poller() -> None:
 
 @app.on_event("startup")
 async def _startup() -> None:
-    """Ensure database is initialised and launch single background poller unless disabled during tests."""
+    """Ensure database is initialised, recover any previously frozen processes, and launch single background poller unless disabled during tests."""
     global _poller_task
     init_db()
+
+    # Startup recovery: resume any LLM processes left frozen by an uncoordinated daemon shutdown
+    recovered = resume_all_throttled_processes()
+    if recovered:
+        logger.warning(
+            "Startup recovery: resumed %d frozen LLM processes left from previous session: %s",
+            len(recovered),
+            recovered,
+        )
+
     if os.getenv("SENTINEL_DISABLE_BACKGROUND_POLLER") == "true":
         return
     if _poller_task is None or _poller_task.done():
@@ -219,7 +311,7 @@ async def _startup() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    """Cancel background poller cleanly on app termination."""
+    """Cancel background poller cleanly and resume all throttled processes on app termination."""
     global _poller_task
     if _poller_task and not _poller_task.done():
         _poller_task.cancel()
@@ -227,6 +319,15 @@ async def _shutdown() -> None:
             await _poller_task
         except asyncio.CancelledError:
             pass
+
+    # Shutdown: resume any currently throttled PIDs so no LLM processes remain frozen
+    resumed = resume_all_throttled_processes()
+    if resumed:
+        logger.info(
+            "Shutdown: resumed %d throttled LLM processes via SIGCONT: %s",
+            len(resumed),
+            resumed,
+        )
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────

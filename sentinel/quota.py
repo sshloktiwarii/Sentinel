@@ -239,26 +239,15 @@ class TokenVelocityTracker:
         subtitle: str = "",
     ) -> None:
         """Send native macOS notification banner via AppleScript osascript."""
-        def _escape(s: str) -> str:
-            return str(s).replace('\\', '\\\\').replace('"', '\\"')
-
-        safe_msg = _escape(message)
-        safe_title = _escape(title)
-        safe_subtitle = _escape(subtitle)
-
-        if safe_subtitle:
-            script = f'display notification "{safe_msg}" with title "{safe_title}" subtitle "{safe_subtitle}"'
+        if subtitle:
+            script = 'on run {msg, title, sub}\ndisplay notification msg with title title subtitle sub\nend run'
+            cmd = ["osascript", "-e", script, message, title, subtitle]
         else:
-            script = f'display notification "{safe_msg}" with title "{safe_title}"'
+            script = 'on run {msg, title}\ndisplay notification msg with title title\nend run'
+            cmd = ["osascript", "-e", script, message, title]
 
         try:
-            subprocess.run(
-                ["osascript", "-e", script],
-                shell=False,
-                check=False,
-                capture_output=True,
-                timeout=5,
-            )
+            subprocess.Popen(cmd)
         except Exception as e:
             logger.warning("Failed to dispatch macOS notification: %s", e)
 

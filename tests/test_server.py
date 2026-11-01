@@ -228,3 +228,112 @@ class TestHardenedServerSecurity:
             with patch("uvicorn.run") as mock_uvicorn:
                 start()
                 mock_uvicorn.assert_called_once_with("sentinel.server:app", host="127.0.0.1", port=8000, reload=False)
+
+
+# ---------------------------------------------------------------------------
+# SE-01: Process Throttling & Zombie Lockup Recovery Tests
+# ---------------------------------------------------------------------------
+
+class TestProcessThrottlingAndRecovery:
+    """Verify security hardening for active process throttling and crash recovery."""
+
+    def test_get_target_llm_pids_exact_matching(self, monkeypatch):
+        from sentinel import server
+
+        with patch("subprocess.check_output", return_value=f"1111\n{server.os.getpid()}\n2222\n") as mock_pgrep:
+            pids = server._get_target_llm_pids()
+            mock_pgrep.assert_called_once_with(
+                ["pgrep", "-x", "ollama|llama-server|vllm|text-generation"],
+                text=True,
+            )
+            # Verify own PID is filtered out and exact PIDs returned
+            assert pids == [1111, 2222]
+
+    def test_apply_throttling_pauses_and_persists(self, tmp_path, monkeypatch):
+        from sentinel import server
+        import signal
+
+        state_file = tmp_path / "throttled.json"
+        monkeypatch.setenv("SENTINEL_THROTTLED_PIDS_PATH", str(state_file))
+        server._THROTTLED_PIDS.clear()
+
+        with patch.object(server, "_get_target_llm_pids", return_value=[4001, 4002]):
+            with patch("os.kill") as mock_kill:
+                actioned = server.apply_active_process_throttling(0.95)
+
+                assert actioned == [4001, 4002]
+                assert server._THROTTLED_PIDS == {4001, 4002}
+                assert mock_kill.call_count == 2
+                mock_kill.assert_any_call(4001, signal.SIGSTOP)
+                mock_kill.assert_any_call(4002, signal.SIGSTOP)
+
+                # Verify persisted to disk
+                assert state_file.exists()
+                persisted = json.loads(state_file.read_text())
+                assert sorted(persisted) == [4001, 4002]
+
+    def test_apply_throttling_resumes_and_cleans_persistence(self, tmp_path, monkeypatch):
+        from sentinel import server
+        import signal
+
+        state_file = tmp_path / "throttled.json"
+        monkeypatch.setenv("SENTINEL_THROTTLED_PIDS_PATH", str(state_file))
+        server._THROTTLED_PIDS.clear()
+        server._THROTTLED_PIDS.update([4001, 4002])
+        server._save_throttled_pids(server._THROTTLED_PIDS)
+
+        with patch("os.kill") as mock_kill:
+            actioned = server.apply_active_process_throttling(0.50)
+
+            assert sorted(actioned) == [4001, 4002]
+            assert server._THROTTLED_PIDS == set()
+            assert mock_kill.call_count == 2
+            mock_kill.assert_any_call(4001, signal.SIGCONT)
+            mock_kill.assert_any_call(4002, signal.SIGCONT)
+
+            # Verify persistence file was removed
+            assert not state_file.exists()
+
+    def test_resume_all_throttled_processes_startup_recovery(self, tmp_path, monkeypatch):
+        from sentinel import server
+        import signal
+
+        state_file = tmp_path / "throttled.json"
+        state_file.write_text(json.dumps([5001, 5002]))
+        monkeypatch.setenv("SENTINEL_THROTTLED_PIDS_PATH", str(state_file))
+        server._THROTTLED_PIDS.clear()
+
+        with patch("os.kill") as mock_kill:
+            # Simulate one dead process raising ProcessLookupError and one alive
+            def kill_side_effect(pid, sig):
+                if pid == 5001:
+                    raise ProcessLookupError()
+                return None
+
+            mock_kill.side_effect = kill_side_effect
+
+            resumed = server.resume_all_throttled_processes()
+
+            assert resumed == [5002]
+            assert server._THROTTLED_PIDS == set()
+            assert not state_file.exists()
+            assert mock_kill.call_count == 2
+
+    def test_shutdown_resumes_throttled_processes(self, tmp_path, monkeypatch):
+        from sentinel import server
+        import signal
+        import asyncio
+
+        state_file = tmp_path / "throttled.json"
+        monkeypatch.setenv("SENTINEL_THROTTLED_PIDS_PATH", str(state_file))
+        server._THROTTLED_PIDS.clear()
+        server._THROTTLED_PIDS.add(6001)
+        server._save_throttled_pids(server._THROTTLED_PIDS)
+
+        with patch("os.kill") as mock_kill:
+            asyncio.run(server._shutdown())
+
+            mock_kill.assert_called_once_with(6001, signal.SIGCONT)
+            assert server._THROTTLED_PIDS == set()
+            assert not state_file.exists()
+
