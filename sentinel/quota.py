@@ -407,7 +407,12 @@ _ANTHROPIC_CACHE: dict = {}
 _ANTHROPIC_TTL = 30.0
 
 def _probe_anthropic() -> dict:
-    """Return updated fields for the 'claude' record, or {} on failure."""
+    """Return updated fields for the 'claude' record, or {} on failure.
+    NOTE: Live paid API probe is disabled by default to avoid incurring billing.
+    Set SENTINEL_PROBE_ANTHROPIC=true to explicitly opt-in."""
+    if os.environ.get("SENTINEL_PROBE_ANTHROPIC", "false").lower() != "true":
+        return {}
+
     global _ANTHROPIC_CACHE, _ANTHROPIC_CACHE_TS
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")

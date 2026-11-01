@@ -163,23 +163,24 @@ def _collect_reading() -> dict:
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
-@app.on_event("startup")
-async def _startup() -> None:
-    """Ensure the database is initialised before the first connection arrives."""
-    init_db()
+# ── Background Single-Poller & Broadcaster ───────────────────────────────────
 
-# ── WebSocket ─────────────────────────────────────────────────────────────────
+_latest_reading: dict | None = None
+_poller_task: asyncio.Task | None = None
+_subscribers: set[asyncio.Queue] = set()
 
-@app.websocket("/ws/telemetry")
-async def ws_telemetry(websocket: WebSocket) -> None:
-    """Stream live telemetry to the connected client at 1-second intervals."""
-    await websocket.accept()
-    try:
-        while True:
+async def _telemetry_poller() -> None:
+    """Dedicated background loop that polls system metrics exactly once per second.
+    Broadcasts the reading to all connected WebSockets without per-client sampling or lock thrash."""
+    global _latest_reading
+    while True:
+        try:
             reading = await asyncio.get_event_loop().run_in_executor(
                 None, _collect_reading
             )
+            _latest_reading = reading
 
+            # Persist to DB once per second
             await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda r=reading: insert_telemetry(
@@ -191,10 +192,67 @@ async def ws_telemetry(websocket: WebSocket) -> None:
                 ),
             )
 
+            # Broadcast to all active websocket subscriber queues
+            for q in list(_subscribers):
+                try:
+                    q.put_nowait(reading)
+                except asyncio.QueueFull:
+                    pass
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Telemetry poller error: %s", e)
+
+        await asyncio.sleep(1.0)
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    """Ensure database is initialised and launch single background poller unless disabled during tests."""
+    global _poller_task
+    init_db()
+    if os.getenv("SENTINEL_DISABLE_BACKGROUND_POLLER") == "true":
+        return
+    if _poller_task is None or _poller_task.done():
+        _poller_task = asyncio.create_task(_telemetry_poller())
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    """Cancel background poller cleanly on app termination."""
+    global _poller_task
+    if _poller_task and not _poller_task.done():
+        _poller_task.cancel()
+        try:
+            await _poller_task
+        except asyncio.CancelledError:
+            pass
+
+
+# ── WebSocket ─────────────────────────────────────────────────────────────────
+
+@app.websocket("/ws/telemetry")
+async def ws_telemetry(websocket: WebSocket) -> None:
+    """Stream live telemetry to the connected client by consuming broadcast events from the single poller."""
+    await websocket.accept()
+    q: asyncio.Queue = asyncio.Queue(maxsize=10)
+    _subscribers.add(q)
+
+    # Immediately deliver current reading if available so client never stalls on connect
+    if _latest_reading is not None:
+        try:
+            await websocket.send_json(_latest_reading)
+        except Exception:
+            pass
+
+    try:
+        while True:
+            reading = await q.get()
             await websocket.send_json(reading)
-            await asyncio.sleep(1)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, asyncio.CancelledError):
         pass
+    finally:
+        _subscribers.discard(q)
 
 # ── REST: history ─────────────────────────────────────────────────────────────
 

@@ -33,6 +33,7 @@ def client(db_path, monkeypatch):
     """
     # Redirect every database call to the temp db
     monkeypatch.setattr(db_module, "_DB_PATH", db_path)
+    monkeypatch.setenv("SENTINEL_DISABLE_BACKGROUND_POLLER", "true")
 
     # Patch harvester so startup doesn't fail on macOS-only syscalls
     monkeypatch.setattr("sentinel.harvester.get_gpu_wired_limit",   lambda: 18_432)
