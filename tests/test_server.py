@@ -249,6 +249,26 @@ class TestProcessThrottlingAndRecovery:
             # Verify own PID is filtered out and exact PIDs returned
             assert pids == [1111, 2222]
 
+    def test_get_target_llm_pids_bsd_fallback_matching(self, monkeypatch):
+        from sentinel import server
+        import subprocess
+
+        # Simulate regex alternation failing on BSD/macOS and falling back to per-process matching
+        def mock_check_output(cmd, text=True):
+            if cmd == ["pgrep", "-x", "ollama|llama-server|vllm|text-generation"]:
+                raise subprocess.CalledProcessError(1, cmd)
+            if cmd == ["pgrep", "-E", "-x", "ollama|llama-server|vllm|text-generation"]:
+                raise subprocess.CalledProcessError(2, cmd, output="pgrep: illegal option -- E")
+            if cmd == ["pgrep", "-x", "ollama"]:
+                return "3333\n"
+            if cmd == ["pgrep", "-x", "llama-server"]:
+                return f"4444\n{server.os.getpid()}\n"
+            return ""
+
+        with patch("subprocess.check_output", side_effect=mock_check_output):
+            pids = server._get_target_llm_pids()
+            assert pids == [3333, 4444]
+
     def test_apply_throttling_pauses_and_persists(self, tmp_path, monkeypatch):
         from sentinel import server
         import signal
@@ -336,4 +356,53 @@ class TestProcessThrottlingAndRecovery:
             mock_kill.assert_called_once_with(6001, signal.SIGCONT)
             assert server._THROTTLED_PIDS == set()
             assert not state_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# Endpoint Authentication & Loopback Protection Tests
+# ---------------------------------------------------------------------------
+
+class TestEndpointSecurity:
+    def test_unauthenticated_request_rejected_when_token_configured(self, monkeypatch):
+        monkeypatch.setenv("SENTINEL_AUTH_TOKEN", "super-secret-token")
+        with TestClient(app) as client:
+            resp = client.get("/api/config")
+            assert resp.status_code == 401
+            assert resp.json() == {"error": "Unauthorized"}
+
+    def test_invalid_bearer_token_rejected(self, monkeypatch):
+        monkeypatch.setenv("SENTINEL_AUTH_TOKEN", "super-secret-token")
+        with TestClient(app) as client:
+            resp = client.get("/api/config", headers={"Authorization": "Bearer wrong-token"})
+            assert resp.status_code == 401
+            assert resp.json() == {"error": "Unauthorized"}
+
+    def test_valid_bearer_token_accepted(self, monkeypatch):
+        monkeypatch.setenv("SENTINEL_AUTH_TOKEN", "super-secret-token")
+        with TestClient(app) as client:
+            resp = client.get("/api/config", headers={"Authorization": "Bearer super-secret-token"})
+            assert resp.status_code == 200
+
+    def test_valid_query_token_accepted(self, monkeypatch):
+        monkeypatch.setenv("SENTINEL_AUTH_TOKEN", "super-secret-token")
+        with TestClient(app) as client:
+            resp = client.get("/api/config?token=super-secret-token")
+            assert resp.status_code == 200
+
+    def test_websocket_rejected_when_token_configured_and_missing(self, monkeypatch):
+        monkeypatch.setenv("SENTINEL_AUTH_TOKEN", "super-secret-token")
+        with TestClient(app) as client:
+            with pytest.raises(Exception):
+                with client.websocket_connect("/ws/telemetry") as ws:
+                    ws.receive_json()
+
+    def test_websocket_accepted_with_valid_token(self, monkeypatch):
+        monkeypatch.setenv("SENTINEL_AUTH_TOKEN", "super-secret-token")
+        patches = _patch_harvester()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/telemetry?token=super-secret-token") as ws:
+                    msg = ws.receive_json()
+                    assert "timestamp" in msg
+
 

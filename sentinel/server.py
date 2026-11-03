@@ -13,15 +13,17 @@ Exposes:
 
 import asyncio
 import atexit
+import hmac
 import json
 import os
 from pathlib import Path
 import time
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import JSONResponse
 
 from sentinel.config import get_config
 from sentinel.database import get_history_window, get_spikes, init_db, insert_telemetry
@@ -50,6 +52,56 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    """Ensure 401 Unauthorized returns JSON body {"error": "Unauthorized"} per interface contract."""
+    if exc.status_code == 401:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Unauthorized"},
+            headers=exc.headers,
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=exc.headers,
+    )
+
+
+def verify_token(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> bool:
+    """Validate Bearer token against SENTINEL_AUTH_TOKEN / SENTINEL_API_KEY.
+
+    If no auth secret is configured, enforces loopback caller restriction.
+    If an auth secret is configured, validates Bearer token using constant-time comparison.
+    """
+    secret = os.environ.get("SENTINEL_AUTH_TOKEN") or os.environ.get("SENTINEL_API_KEY")
+    if secret:
+        token = None
+        if authorization:
+            parts = authorization.split()
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                token = parts[1]
+        if not token:
+            token = request.query_params.get("token")
+        if not token or not hmac.compare_digest(token, secret):
+            raise HTTPException(
+                status_code=401,
+                detail="Unauthorized",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return True
+
+    # If no token is configured, enforce loopback
+    client_host = request.client.host if request.client else None
+    if client_host and client_host not in ("127.0.0.1", "::1", "localhost", "testclient"):
+        raise HTTPException(status_code=403, detail="Forbidden: non-loopback access prohibited")
+
+    return True
+
 
 import logging
 import signal
@@ -131,23 +183,49 @@ atexit.register(resume_all_throttled_processes)
 
 
 def _get_target_llm_pids() -> list[int]:
-    """Find running local LLM engine processes (ollama, llama-server, vllm) using exact matching."""
-    pids = []
+    """Find running local LLM engine processes (ollama, llama-server, vllm) using exact matching.
+
+    Handles Linux, macOS, and BSD systems where regex alternation with -x may require -E or
+    per-process matching to avoid silent pgrep failures.
+    """
+    pids: set[int] = set()
+    current_pid = os.getpid()
+    target_names = ["ollama", "llama-server", "vllm", "text-generation"]
+    pattern = "|".join(target_names)
+
+    # Primary check: exact pattern match across process names
     try:
-        output = subprocess.check_output(
-            ["pgrep", "-x", "ollama|llama-server|vllm|text-generation"],
-            text=True,
-        )
+        output = subprocess.check_output(["pgrep", "-x", pattern], text=True)
         for line in output.strip().splitlines():
             line_str = line.strip()
-            if not line_str:
-                continue
-            pid = int(line_str)
-            if pid != os.getpid():
-                pids.append(pid)
+            if line_str and line_str.isdigit():
+                pid = int(line_str)
+                if pid != current_pid:
+                    pids.add(pid)
     except Exception:
-        pass
-    return pids
+        # Fallback for BSD/Darwin systems where regex alternation requires -E or individual name queries
+        try:
+            output = subprocess.check_output(["pgrep", "-E", "-x", pattern], text=True)
+            for line in output.strip().splitlines():
+                line_str = line.strip()
+                if line_str and line_str.isdigit():
+                    pid = int(line_str)
+                    if pid != current_pid:
+                        pids.add(pid)
+        except Exception:
+            for name in target_names:
+                try:
+                    out = subprocess.check_output(["pgrep", "-x", name], text=True)
+                    for line in out.strip().splitlines():
+                        line_str = line.strip()
+                        if line_str and line_str.isdigit():
+                            pid = int(line_str)
+                            if pid != current_pid:
+                                pids.add(pid)
+                except Exception:
+                    pass
+
+    return sorted(list(pids))
 
 
 def apply_active_process_throttling(thrash_index: float) -> list[int]:
@@ -335,6 +413,27 @@ async def _shutdown() -> None:
 @app.websocket("/ws/telemetry")
 async def ws_telemetry(websocket: WebSocket) -> None:
     """Stream live telemetry to the connected client by consuming broadcast events from the single poller."""
+    secret = os.environ.get("SENTINEL_AUTH_TOKEN") or os.environ.get("SENTINEL_API_KEY")
+    if secret:
+        query_params = getattr(websocket, "query_params", {})
+        token = query_params.get("token") if hasattr(query_params, "get") else None
+        if not token:
+            headers = getattr(websocket, "headers", {})
+            auth_header = headers.get("authorization") if hasattr(headers, "get") else None
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header[7:].strip()
+        if not token or not hmac.compare_digest(token, secret):
+            if hasattr(websocket, "close"):
+                await websocket.close(code=1008)
+            return
+
+    client = getattr(websocket, "client", None)
+    client_host = client.host if client and hasattr(client, "host") else None
+    if not secret and client_host and client_host not in ("127.0.0.1", "::1", "localhost", "testclient"):
+        if hasattr(websocket, "close"):
+            await websocket.close(code=1008)
+        return
+
     await websocket.accept()
     q: asyncio.Queue = asyncio.Queue(maxsize=10)
     _subscribers.add(q)
@@ -362,7 +461,8 @@ async def api_history(
     window: Literal["1m", "5m", "1h"] = Query(
         default     = "1m",
         description = "Time window: '1m' (60 s raw), '5m' (300 s sampled), '1h' (3600 s bucketed).",
-    )
+    ),
+    _auth: bool = Depends(verify_token),
 ) -> list[dict]:
     """Return historical telemetry for the requested time window.
 
@@ -379,7 +479,7 @@ async def api_history(
 # ── REST: spikes ──────────────────────────────────────────────────────────────
 
 @app.get("/api/spikes")
-async def api_spikes() -> list[dict]:
+async def api_spikes(_auth: bool = Depends(verify_token)) -> list[dict]:
     """Return the top-5 spike events (thrash_index >= 0.4 or swap > 0) in the last 24 h.
 
     Each item contains: timestamp, thrash_index, wired_mb, swap_used_mb, pageouts.
@@ -395,7 +495,8 @@ async def api_quotas(
     wrap: bool = Query(
         default=False,
         description="When true, wraps list in a dict containing top-level velocity block",
-    )
+    ),
+    _auth: bool = Depends(verify_token),
 ) -> Any:
     """Return quota health snapshot for all configured AI providers.
 
@@ -417,21 +518,21 @@ async def api_quotas(
 # ── REST: velocity ────────────────────────────────────────────────────────────
 
 @app.get("/api/velocity")
-async def api_velocity() -> dict:
+async def api_velocity(_auth: bool = Depends(verify_token)) -> dict:
     """Return instantaneous token velocity and runaway agent loop detection metrics."""
     return get_velocity_metrics()
 
 # ── REST: telemetry ───────────────────────────────────────────────────────────
 
 @app.get("/api/telemetry")
-async def api_telemetry() -> dict:
+async def api_telemetry(_auth: bool = Depends(verify_token)) -> dict:
     """Return instantaneous system telemetry snapshot with KV-cache pressure."""
     return await asyncio.get_event_loop().run_in_executor(None, _collect_reading)
 
 # ── REST: engines ─────────────────────────────────────────────────────────────
 
 @app.get("/api/engines")
-async def api_engines() -> dict:
+async def api_engines(_auth: bool = Depends(verify_token)) -> dict:
     """Return active local LLM engine status, loaded models, and KV-cache breakdown."""
     wired_mb = await asyncio.get_event_loop().run_in_executor(None, get_wired_memory_mb)
     return await get_local_engines_async(wired_mb=wired_mb)
@@ -440,7 +541,7 @@ async def api_engines() -> dict:
 # ── REST: config ──────────────────────────────────────────────────────────────
 
 @app.get("/api/config")
-async def api_config() -> dict:
+async def api_config(_auth: bool = Depends(verify_token)) -> dict:
     """Return active user configuration."""
     return get_config()
 
