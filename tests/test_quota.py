@@ -108,8 +108,8 @@ class TestTelemetryParsing:
     def test_parse_empty_payloads(self):
         updates = _parse_omniroute_telemetry(None, None, None)
         assert "omniroute" in updates
-        assert updates["omniroute"]["remaining_pct"] == 94
-        assert updates["omniroute"]["tokens_left"] == "Unlimited / Self-Hosted"
+        assert updates["omniroute"]["remaining_pct"] == 0
+        assert "Offline" in updates["omniroute"]["tokens_left"] or "Unreachable" in updates["omniroute"]["tokens_left"]
 
 
 class TestPublicQuotasApi:

@@ -16,6 +16,7 @@ import atexit
 import hmac
 import json
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 import time
 from typing import Any, Literal
@@ -39,7 +40,58 @@ from sentinel.harvester import (
 )
 from sentinel.quota import get_all_quotas, get_velocity_metrics
 
-app = FastAPI(title="Sentinel-AI")
+_poller_task: asyncio.Task[None] | None = None
+
+
+async def _startup() -> None:
+    """Ensure database is initialised, recover any previously frozen processes, and launch single background poller unless disabled during tests."""
+    global _poller_task
+    init_db()
+
+    # Startup recovery: resume any LLM processes left frozen by an uncoordinated daemon shutdown
+    recovered = resume_all_throttled_processes()
+    if recovered:
+        logger.warning(
+            "Startup recovery: resumed %d frozen LLM processes left from previous session: %s",
+            len(recovered),
+            recovered,
+        )
+
+    if os.getenv("SENTINEL_DISABLE_BACKGROUND_POLLER") == "true":
+        return
+    if _poller_task is None or _poller_task.done():
+        _poller_task = asyncio.create_task(_telemetry_poller())
+
+
+async def _shutdown() -> None:
+    """Cancel background poller cleanly and resume all throttled processes on app termination."""
+    global _poller_task
+    if _poller_task and not _poller_task.done():
+        _poller_task.cancel()
+        try:
+            await _poller_task
+        except asyncio.CancelledError:
+            pass
+
+    # Shutdown: resume any currently throttled PIDs so no LLM processes remain frozen
+    resumed = resume_all_throttled_processes()
+    if resumed:
+        logger.info(
+            "Shutdown: resumed %d throttled LLM processes via SIGCONT: %s",
+            len(resumed),
+            resumed,
+        )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Modern FastAPI lifespan context manager for startup and shutdown execution."""
+    await _startup()
+    yield
+    await _shutdown()
+
+
+app = FastAPI(title="Sentinel-AI", lifespan=lifespan)
 
 # Restrict CORS strictly to local loopback origins; wildcard ["*"] is explicitly forbidden.
 app.add_middleware(
@@ -366,46 +418,7 @@ async def _telemetry_poller() -> None:
         await asyncio.sleep(1.0)
 
 
-@app.on_event("startup")
-async def _startup() -> None:
-    """Ensure database is initialised, recover any previously frozen processes, and launch single background poller unless disabled during tests."""
-    global _poller_task
-    init_db()
 
-    # Startup recovery: resume any LLM processes left frozen by an uncoordinated daemon shutdown
-    recovered = resume_all_throttled_processes()
-    if recovered:
-        logger.warning(
-            "Startup recovery: resumed %d frozen LLM processes left from previous session: %s",
-            len(recovered),
-            recovered,
-        )
-
-    if os.getenv("SENTINEL_DISABLE_BACKGROUND_POLLER") == "true":
-        return
-    if _poller_task is None or _poller_task.done():
-        _poller_task = asyncio.create_task(_telemetry_poller())
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    """Cancel background poller cleanly and resume all throttled processes on app termination."""
-    global _poller_task
-    if _poller_task and not _poller_task.done():
-        _poller_task.cancel()
-        try:
-            await _poller_task
-        except asyncio.CancelledError:
-            pass
-
-    # Shutdown: resume any currently throttled PIDs so no LLM processes remain frozen
-    resumed = resume_all_throttled_processes()
-    if resumed:
-        logger.info(
-            "Shutdown: resumed %d throttled LLM processes via SIGCONT: %s",
-            len(resumed),
-            resumed,
-        )
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────

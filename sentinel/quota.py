@@ -62,28 +62,28 @@ _BASELINE: list[dict] = [
         "id":            "claude",
         "provider":      "Anthropic Claude",
         "model":         "Claude 3.5 Sonnet",
-        "remaining_pct": 82,
-        "tokens_left":   "164k / 200k",
-        "resets_in":     "3h 12m",
-        "status":        "healthy",
+        "remaining_pct": 0,
+        "tokens_left":   "Not Configured",
+        "resets_in":     "—",
+        "status":        "exhausted",
     },
     {
         "id":            "codex",
         "provider":      "OpenAI / Codex",
         "model":         "GPT-4o / o1-mini",
-        "remaining_pct": 65,
-        "tokens_left":   "650k TPM",
-        "resets_in":     "Daily (00:00 UTC)",
-        "status":        "healthy",
+        "remaining_pct": 0,
+        "tokens_left":   "Not Configured",
+        "resets_in":     "—",
+        "status":        "exhausted",
     },
     {
         "id":            "omniroute",
         "provider":      "OmniRoute Proxy",
         "model":         "Local Gateway :20128",
-        "remaining_pct": 94,
-        "tokens_left":   "Unlimited / Self-Hosted",
-        "resets_in":     "Active",
-        "status":        "healthy",
+        "remaining_pct": 0,
+        "tokens_left":   "Offline (:20128)",
+        "resets_in":     "—",
+        "status":        "exhausted",
         "velocity": {
             "tps": 0.0,
             "tpm": 0.0,
@@ -96,36 +96,36 @@ _BASELINE: list[dict] = [
         "id":            "kilocode",
         "provider":      "KiloCode Agent",
         "model":         "Kilo Router / Hybrid",
-        "remaining_pct": 100,
-        "tokens_left":   "100% available",
-        "resets_in":     "Active",
-        "status":        "healthy",
+        "remaining_pct": 0,
+        "tokens_left":   "Not Configured",
+        "resets_in":     "—",
+        "status":        "exhausted",
     },
     {
         "id":            "kimi",
         "provider":      "Moonshot Kimi",
         "model":         "Kimi 128k",
-        "remaining_pct": 40,
-        "tokens_left":   "40k / 100k",
-        "resets_in":     "1h 45m",
-        "status":        "warning",
+        "remaining_pct": 0,
+        "tokens_left":   "Not Configured",
+        "resets_in":     "—",
+        "status":        "exhausted",
     },
     {
         "id":            "cursor",
         "provider":      "Cursor Tab / Fast Requests",
         "model":         "Sonnet 3.5 Copilot",
-        "remaining_pct": 28,
-        "tokens_left":   "140 / 500 reqs",
-        "resets_in":     "6 days",
-        "status":        "warning",
+        "remaining_pct": 0,
+        "tokens_left":   "Not Configured",
+        "resets_in":     "—",
+        "status":        "exhausted",
     },
     {
         "id":            "manus",
         "provider":      "Manus / Agent Sandbox",
         "model":         "Full Autonomous Runner",
-        "remaining_pct": 12,
-        "tokens_left":   "12 / 100 credits",
-        "resets_in":     "Tomorrow",
+        "remaining_pct": 0,
+        "tokens_left":   "Not Configured",
+        "resets_in":     "—",
         "status":        "exhausted",
     },
 ]
@@ -579,13 +579,17 @@ def _parse_omniroute_telemetry(
         )
         total_providers = max(len(providers_list), 1)
         omni_pct = round((available_count / total_providers) * 100)
+    elif analytics_data or stats_payload:
+        omni_pct = 100
     else:
-        omni_pct = 94
+        omni_pct = 0
 
     if total_tokens > 0 or total_reqs > 0:
         tokens_left_str = f"{_fmt_tokens(total_tokens)} tokens / {total_reqs} reqs"
-    else:
+    elif analytics_data or stats_payload:
         tokens_left_str = "Unlimited / Self-Hosted"
+    else:
+        tokens_left_str = "Offline / Unreachable"
 
     omni_status = _status_from_pct(omni_pct)
     updates["omniroute"] = {
